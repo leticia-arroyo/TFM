@@ -1,0 +1,249 @@
+---
+title: "meta modelo concat de prediccioines"
+author: "Leticia Arroyo Benito"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: '2'
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float:
+      collapse: false
+      smooth_scroll: true
+always_allow_html: true
+table_format: simple
+---
+Pasa como entrada al meta modelo (dense model) las predicciones de un modelo entrenado fully connected (para los 3PC), y un modelo LSTM (para las secuencias) (todos modelos guardados .h5).
+Al hacer cross-validation, tomamos como datos "a preparar" para entrar a los modelos base: 
+el df de datos totales (con DA del total no sólo de los train).
+Para el modelo denso usamos los PC normalizados, y para el LSTM las secuencias vectorizadas. 
+La cross-validación divide el conjunto de entrenamiento en 5 folds y en cada una de las 5 iteraciones emplea 4 para entrenar y 1 para validar.
+
+```{r librerias, include=FALSE}
+library(data.table)
+library(ggplot2)
+library(ggrepel)
+library(openxlsx)
+library(stats)
+library(reshape2)
+library(dplyr)
+library(stringr)
+library(tensorflow)
+library(reticulate)
+library(writexl)
+library(keras)
+library(caret)
+
+```
+## datos generales
+```{r datos_tr_y_te}
+dt <-"df_TRA_modelos.xlsx"
+dt<-data.frame(read.xlsx(dt))
+row.names(dt)<-dt$Name
+y_train <- as.integer(dt$Label_TRA)
+```
+
+## Datos fully connected
+```{r}
+x_train_PC<- dt[, 4:6]
+
+#conversioin a tensores
+x_train_PC <- as_tensor(x_train_PC)
+
+```
+
+
+## datos LSTM
+```{r}
+# vocabulario
+vocab <- c("A", "C", "D", "E", "F", "G", "H", "I", "K", "L", 
+           "M", "N", "P", "Q", "R", "S", "T", "V", "W", "Y")
+
+
+max_len <- 271
+
+# Crear el vectorizador 
+text_vectorizer <- layer_text_vectorization(
+  standardize = NULL,                    # NO! x defecto a minusc y separa x espac en blanco
+  max_tokens = length(vocab) + 2,        # AA + UNK + 0(padding)
+  output_mode = "int",
+  output_sequence_length = max_len,
+  split = "character"                    # caracteres, no palabras
+)
+
+
+text_vectorizer %>% set_vocabulary(vocab)
+
+#secuencias "text only"
+seq_train <- as.character(dt$Sequence)
+
+
+
+# Aplico text_vectoricer a las secuencias
+vectorized_train <- text_vectorizer(seq_train)
+
+
+
+# transformo en array
+x_train <- as.array(vectorized_train) 
+
+
+max_tokens <- 22 
+seq_length <- 271 
+
+```
+
+## CrossValidation
+```{r, message=FALSE}
+#En cada iteración 4 folds para train y 1 xa val createFolds() crea particiones de los datos
+
+set.seed(12345)
+folds <- createFolds(y_train, k = 5, list = TRUE, returnTrain = TRUE) #y_train para reparto equitativo de etiquetas en cada fold
+
+y_train <- matrix(y_train, ncol = 1)
+x_train_PC <- as.matrix(x_train_PC)
+
+#vect xa guardar resultados de la métrica de la iteración
+cv_results <- c()
+
+#creo un df aux xa guardar las métricas de cada iteración, y plotearlo junto
+metrics_data <- data.frame(
+  fold = integer(),
+  epoch = integer(),
+  loss = numeric(),
+  accuracy = numeric()
+)
+```
+
+
+```{r, message=FALSE}
+# Iterar
+for (i in seq_along(folds)) {
+  
+  # Dividir en train y val (indices)
+  train_idx <- folds[[i]]
+  val_idx <- setdiff(seq_along(y_train), train_idx)
+  
+  # Datos train
+  x_train_ann <- x_train_PC[train_idx, , drop = FALSE]
+  x_train_rnn <- x_train[train_idx, , drop = FALSE]
+  y_train_fold <- y_train[train_idx]
+  
+  # Datos val
+  x_val_ann <- x_train_PC[val_idx, , drop = FALSE]
+  x_val_rnn <- x_train[val_idx, , drop = FALSE]
+  y_val_fold <- y_train[val_idx]
+  
+  # fit de los 2 modelos (fully y LSTM que estaban guardados)
+  
+  modelANN <- load_model_hdf5("ANN_TRA_modelo_entrenado.h5")
+  modelANN %>% fit(
+    x_train_ann,
+    y_train_fold,
+    epochs = 20,
+    batch_size = 32,
+  )
+  
+  modelRNN <- load_model_hdf5("RNN_TRA_modelo_entrenado.h5")
+  modelRNN %>% fit(
+    x_train_rnn,
+    y_train_fold,
+    epochs = 20,
+    batch_size = 16,
+  )
+  
+  # Predicciones modelos base (entrada de datos meta-modelo)
+  val_pred_ann <- predict(modelANN, x_val_ann)
+  val_pred_rnn <- predict(modelRNN, x_val_rnn)
+  
+
+  # datos meta-modelo
+  meta_train_x <- cbind(val_pred_ann, val_pred_rnn)
+  meta_train_y <- y_val_fold
+  
+  # Entrenar el meta-modelo
+  input_ann <- layer_input(shape = c(1), name = "input_ann")
+  input_rnn <- layer_input(shape = c(1), name = "input_rnn")
+  
+  merged <- layer_concatenate(list(input_ann, input_rnn))
+  
+  output <- merged %>%
+    layer_dense(units = 16, activation = "relu") %>%
+    layer_dense(units = 1, activation = "sigmoid")
+  
+  MM <- keras_model(inputs = list(input_ann, input_rnn), outputs = output)
+  
+  MM %>% compile(
+    optimizer = optimizer_rmsprop(),
+    loss = "binary_crossentropy",
+    metrics = c("accuracy")
+  )
+  
+  history <- MM %>% fit(
+    list(meta_train_x[, 1], meta_train_x[, 2]),
+    meta_train_y,
+    epochs = 20,
+    batch_size = 32,
+    verbose = 0,
+    validation_split = 0  # 0 xq usamos los folds para validación
+    
+  )
+  # Predicciones fold 1 xa ANN y 2 xa LSTM
+  val_pred_meta <- predict(MM, list(meta_train_x[, 1], meta_train_x[, 2]))
+  
+  # Evaluar accuracy y guardar en el vector los datos de cada iteración
+  fold_accuracy <- sum(round(val_pred_meta) == y_val_fold) / length(y_val_fold)
+  cv_results <- c(cv_results, fold_accuracy)
+
+  
+   # métricas
+  history_metrics <- data.frame(
+    fold = i,
+    epoch = seq_len(20),
+    loss = history$metrics$loss,
+    accuracy = history$metrics$accuracy
+  )
+  
+  # Relleno el df que creé conlos datos de métricas para plot
+  metrics_data <- rbind(metrics_data, history_metrics)
+  
+}
+```
+
+
+```{r, message=FALSE}
+
+
+# accuracy de los 5 folds
+cv_results
+mean(cv_results)
+
+# Gráfico para loss
+ggplot(metrics_data, aes(x = epoch, y = loss, color = factor(fold))) +
+  geom_line(size = 1) +
+  labs(
+    title = "Evolución de Loss por Fold",
+    x = "Épocas",
+    y = "Loss",
+    color = "Fold"
+  ) +
+  theme_minimal()+
+  ylim (0,1)
+
+# Gráfico para accuracy
+ggplot(metrics_data, aes(x = epoch, y = accuracy, color = factor(fold))) +
+  geom_line(size = 1) +
+  labs(
+    title = "Evolución de Accuracy por Fold",
+    x = "Épocas",
+    y = "Accuracy",
+    color = "Fold"
+  ) +
+  theme_minimal()+
+   ylim (0,1)
+
+
+
+```

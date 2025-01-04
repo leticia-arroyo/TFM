@@ -1,0 +1,208 @@
+---
+title: "modelo CV concat entradas TRA"
+author: "Leticia Arroyo Benito"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: '2'
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float:
+      collapse: false
+      smooth_scroll: true
+---
+```{r, include=FALSE}
+library(data.table)
+library(ggplot2)
+library(ggrepel)
+library(openxlsx)
+library(stats)
+library(reshape2)
+library(dplyr)
+library(stringr)
+library(tensorflow)
+library(reticulate)
+library(writexl)
+library(keras)
+library(caret) 
+
+```
+
+## Datos de entrada
+```{r}
+dt <-"df_TRA_modelos.xlsx"
+dt<-data.frame(read.xlsx(dt))
+row.names(dt)<-dt$Name
+
+y_train <- as.integer(dt$Label_TRA)
+x_train_PC <- dt[, 4:6]
+x_train <- dt$Sequence
+
+#Preparar los datos para que puedan entrar en los modelos
+
+y_train <- matrix(y_train, ncol = 1)
+    
+    #Modelo denso: conversion a tensores
+x_train_PC <- as_tensor(x_train_PC)
+x_train_PC <- as.matrix(x_train_PC)
+
+    #Modelo LSTM: vectorizar secuencia
+# vocabulario
+vocab <- c("A", "C", "D", "E", "F", "G", "H", "I", "K", "L", 
+           "M", "N", "P", "Q", "R", "S", "T", "V", "W", "Y")
+
+max_len <- 271
+
+# Crear el vectorizador 
+text_vectorizer <- layer_text_vectorization(
+  standardize = NULL,                    
+  max_tokens = length(vocab) + 2,     # AA + UNK + 0(padding)
+  output_mode = "int",
+  output_sequence_length = max_len,
+  split = "character"                    
+)
+
+
+text_vectorizer %>% set_vocabulary(vocab)
+
+# Aplico text_vectoricer a las secuencias
+vectorized_train <- text_vectorizer(x_train)
+
+# transformo en array
+x_train <- as.array(vectorized_train)
+
+
+max_tokens <- 22 
+seq_length <- 271 
+
+```
+## Folds y Modelo
+```{r}
+#En cada iteración 4 folds para train y 1 xa validar
+k_folds <- 5
+set.seed(123456)
+folds <- createFolds(y = y_train, k = k_folds, list = TRUE)
+# Para almacenar los resultados de cada fold
+results <- c()
+conf_matrices <- list()
+plot_list <- list()
+plot_a_list <- list()
+
+for (i in seq_along(folds)) {
+  
+  # Dividir datos en entrenamiento y validación para este fold
+  val_idx <- folds[[i]] #los indices del fold actual son los utilizados para validar
+  train_idx <- setdiff(seq_len(length(y_train)), val_idx)#indices restantes para train (setdiff: diferencia entre todos los indices y los destinados a val)
+  
+#datos train  
+  x_train_fold_PC <- x_train_PC[train_idx, , drop = FALSE]
+  x_train_fold_seq <- x_train[train_idx, , drop = FALSE]
+  y_train_fold <- y_train[train_idx]
+  
+#datos val
+  x_val_fold_PC <- x_train_PC[val_idx, , drop = FALSE]
+  x_val_fold_seq <- x_train[val_idx, , drop = FALSE]
+  y_val_fold <- y_train[val_idx]
+
+## Modelo
+# modelo denso para los PC (= q el de no cv)
+  input_pc <- layer_input(shape = c(ncol(x_train_PC)), name = "input_pc")
+  dense_pc <- input_pc %>%
+    layer_dense(units = 16, activation = "relu") %>%
+    layer_dense(units = 8, activation = "relu")
+#LSTM para las secuencias 
+  inputs <- layer_input(shape = c(seq_length), dtype = "int64")
+  embedded <- inputs %>%
+    tf$one_hot(depth = as.integer(max_tokens)) %>% #codifico a one-hot
+    bidirectional(layer_lstm(units = 32, return_sequences = FALSE)) #32 units  = que LSTM, en concat entradas puse 64. return_seq = FALSE es la opción por defecto, lo dejo así para que me devuelva un vector con el último estado
+  
+#concatenar los2
+  merged <- layer_concatenate(list(dense_pc, embedded))
+ 
+#capa final tb densa. binaria. salida probabilidad sigmoide 
+  output <- merged %>%
+    layer_dense(units = 32, activation = "relu") %>%
+    layer_dropout(rate = 0.5) %>%
+    layer_dense(units = 1, activation = "sigmoid")
+  
+ model <- keras_model(inputs = list(input_pc, inputs), outputs = output)
+  
+  model %>% compile(
+    optimizer = optimizer_rmsprop(learning_rate = 0.001),
+    loss = "binary_crossentropy",
+    metrics = c("accuracy")
+  )
+  
+   # entrenamiento, igual qiue el que no lleva cv
+  history <- model %>% fit(
+    list(x_train_fold_PC, x_train_fold_seq),  
+    y_train_fold, 
+    validation_data = list(list(x_val_fold_PC, x_val_fold_seq), y_val_fold),
+    epochs = 20,
+    batch_size = 32,
+    verbose = 1
+  )
+  
+  
+  # Convertir el history a data.frame para graficar
+  history_df <- data.frame(
+    epoch = seq_len(length(history$metrics$loss)),
+    loss = history$metrics$loss,
+    val_loss = history$metrics$val_loss,
+    accuracy = history$metrics$accuracy,
+    val_accuracy = history$metrics$val_accuracy
+  )
+  
+  # Generar gráfico de loss  
+  p <- ggplot(history_df, aes(x = epoch)) +
+    geom_line(aes(y = loss), color = "gray", linetype = "dashed", size = 1, alpha = 0.7) +
+    geom_line(aes(y = val_loss), color = "blue", size = 1) +
+    labs(title = paste("Fold", i, "- Loss"), y = "Loss", x = "Epoch") +
+    theme_minimal()
+  
+  # Generar gráfico de accuracy
+    q <- ggplot(history_df, aes(x = epoch)) +
+    geom_line(aes(y = accuracy), color = "gray", linetype = "dashed", size = 1, alpha = 0.7) +
+    geom_line(aes(y = val_accuracy), color = "blue", size = 1) +
+    labs(title = paste("Fold", i, "- accuracy"), y = "Accuracy", x = "Epoch") +
+    theme_minimal()
+    
+    
+    
+   plot_list[[i]] <- p
+   plot_a_list[[i]] <- q
+  
+  # Predicciones conjunto de validación
+  y_pred <- model %>% predict(list(x_val_fold_PC, x_val_fold_seq))
+  y_pred_bin <- ifelse(y_pred > 0.5, 1, 0)
+  
+  # Matriz de confusión
+  conf_matrix <- confusionMatrix(
+    factor(y_pred_bin, levels = c(0, 1)), # Predicciones
+    factor(y_val_fold, levels = c(0, 1)),  # Reales
+    positive = "1"  
+  )
+  
+  print(conf_matrix) 
+  conf_matrices[[i]] <- conf_matrix # Guardar matriz de confusión
+  
+ 
+  # Guardar el resultado de este fold
+    results[i] <- conf_matrix$overall["Accuracy"]
+    
+    
+}
+
+
+results
+
+for (i in seq_along(plot_list)) {
+  print(plot_list[[i]])
+}
+for (i in seq_along(plot_list)) {
+  print(plot_a_list[[i]])
+}
+
+```
+

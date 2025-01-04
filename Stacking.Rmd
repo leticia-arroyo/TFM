@@ -1,0 +1,247 @@
+---
+title: "modelo concat TRA 2"
+author: "Leticia Arroyo Benito"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: '2'
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float:
+      collapse: false
+      smooth_scroll: true
+---
+```{r librerias, include=FALSE}
+library(data.table)
+library(ggplot2)
+library(ggrepel)
+library(openxlsx)
+library(stats)
+library(reshape2)
+library(dplyr)
+library(stringr)
+library(tensorflow)
+library(reticulate)
+library(writexl)
+library(keras)
+```
+## datos
+Si hago un vector aleatorio para seleccionar el 80%-20% de los datos, me va seleccionar parte de los datos aumentados para el set de test. Elijo por tanto como conjunto de test las 20 proteinas que seleccione "originales" a las que no apliqué DA
+Las label van a ser comunes para los 2 modelos, pero la x no
+```{r datos_tr_y_te}
+dt <-"df_TRA_concat.xlsx"
+dt<-data.frame(read.xlsx(dt))
+row.names(dt)<-dt$Eple
+
+test <- data.frame(read.xlsx("test_TRA.xlsx"))
+Eple_test <- test$Name
+
+#Normalizo lo PC1 to 3
+pc_norm <- as.data.frame(lapply(dt[, c("PC1", "PC2", "PC3")], function(x) {
+  (x - min(x)) / (max(x) - min(x))
+}))
+
+dt[, 1:3]<- NULL
+dt <- cbind(dt, pc_norm)
+train_data <- dt[!(rownames(dt) %in% Eple_test), ]
+
+set.seed(123)
+indice_sel <- sample(1:nrow(train_data), size = 0.8*nrow(train_data),replace=F)
+
+
+# Divido en train y val
+train_data <- train_data[indice_sel, ]
+val_data <- train_data[-indice_sel, ]
+test_data <- dt[rownames(dt) %in% Eple_test, ]
+
+y_train <- as.integer(train_data$Label)
+y_test <- as.integer(test_data$Label)
+y_val  <- as.integer(val_data$Label)
+
+```
+## Modelo ANN
+### Preparar datos
+```{r}
+x_train_PC<- train_data[, 4:6]
+x_val_PC<- val_data[, 4:6]
+x_test_PC<- test_data[, 4:6]
+#conversioin a tensores
+x_train_PC <- as_tensor(x_train_PC)
+x_val_PC <- as_tensor(x_val_PC)
+x_test_PC <- as_tensor(x_test_PC)
+
+```
+
+### Modelo
+```{r}
+modelANN <- load_model_hdf5("ANN_TRA_modelo_entrenado.h5")
+
+#entrenar
+set.seed(12345)
+historyANN <- modelANN %>% fit(
+x_train_PC,
+y_train,
+epochs = 20,
+batch_size = 8,
+validation_data = list(x_val_PC, y_val)
+)
+
+plot(historyANN)
+
+```
+
+## Modelo RNN
+### Preparar datos
+```{r}
+# vocabulario
+vocab <- c("A", "C", "D", "E", "F", "G", "H", "I", "K", "L", 
+           "M", "N", "P", "Q", "R", "S", "T", "V", "W", "Y")
+
+
+max_len <- 271
+
+# Crear el vectorizador 
+text_vectorizer <- layer_text_vectorization(
+  standardize = NULL,                    # NO! x defecto a minusc y separa x espac en blanco
+  max_tokens = length(vocab) + 2,        # AA + UNK + 0(padding)
+  output_mode = "int",
+  output_sequence_length = max_len,
+  split = "character"                    # caracteres, no palabras
+)
+
+
+text_vectorizer %>% set_vocabulary(vocab)
+
+#secuencias "text only"
+seq_train <- as.character(train_data$Sequence)
+seq_test <- as.character(test_data$Sequence)
+seq_val <- as.character(val_data$Sequence)
+
+# Aplico text_vectoricer a las secuencias
+vectorized_train <- text_vectorizer(seq_train)
+vectorized_test <- text_vectorizer(seq_test)
+vectorized_val <- text_vectorizer(seq_val)
+
+# transformo en array
+x_train <- as.array(vectorized_train)  
+x_val <- as.array(vectorized_val)
+x_test <- as.array(vectorized_test)
+
+max_tokens <- 22 
+seq_length <- 271 
+
+```
+
+### Modelo 
+```{r}
+#modeloRNN
+modelRNN <- load_model_hdf5("RNN_TRA_modelo_entrenado.h5")
+historyRNN <- modelRNN %>% fit(
+  x = x_train, y = y_train,
+  validation_data = list(x_val, y_val),
+  epochs = 20,
+  batch_size = 8
+)
+
+
+plot(historyRNN)
+
+```
+
+## Meta-modelo Keras Functional API
+Modelo con las  predicciones del conjunto val
+
+```{r}
+# Predicciones conjunto de entrenamiento
+train_pred_ann <- predict(modelANN, x_val_PC) # Salida ANN
+train_pred_rnn <- predict(modelRNN, x_val)  # Salida RNN
+
+meta_train_x <- cbind(train_pred_ann, train_pred_rnn)
+meta_train_y <- y_train  # Etiquetas reales
+
+# Crear el meta-modelo con Keras Functional API
+input_ann <- layer_input(shape = c(1), name = "input_ann")
+input_rnn <- layer_input(shape = c(1), name = "input_rnn")
+
+merged <- layer_concatenate(list(input_ann, input_rnn))
+
+# ANN meta-modelo
+output <- merged %>%
+  layer_dense(units = 16, activation = "relu") %>%
+  layer_dense(units = 1, activation = "sigmoid") #prob 0-1
+
+MM <- keras_model(inputs = list(input_ann, input_rnn), outputs = output)
+
+
+#compilar
+MM %>% compile(
+  optimizer = optimizer_rmsprop(),
+  loss = "binary_crossentropy",
+  metrics = "accuracy"
+)
+#fit
+history_MM <- MM %>% fit(
+  x = list(train_pred_ann, train_pred_rnn),
+  y = meta_train_y,
+  epochs = 20,
+  batch_size = 8,
+  validation_split = 0.4
+)
+
+
+plot(history_MM)
+```
+
+
+
+
+```{r}
+# Predicciones finales en el conjunto de prueba
+test_pred_ann <- predict(modelANN, x_test_PC)
+test_pred_rnn <- predict(modelRNN, x_test)
+
+pred_MM <- MM %>% predict(list(test_pred_ann, test_pred_rnn))
+
+pred_MM<- ifelse(pred_MM >= 0.5,1, 0)
+
+y_test <- as.numeric(as.character(y_test))
+
+comp<- cbind(y_test, pred_MM)
+
+
+row.names(comp)<- test_data$Eple
+colnames(comp)<- c("real", "pred_MM")
+
+y_predict <- factor(pred_MM, levels = c(0, 1))
+y_test <- factor(y_test, levels = c(0, 1))
+# matriz de confusión
+library(caret)
+evalRNN <- confusionMatrix(y_predict, y_test,positive = "1")
+evalRNN
+```
+
+
+### Summary
+
+```{r}
+test_pred_ann <- predict(modelANN, x_test_PC)
+test_pred_ann<- ifelse(test_pred_ann >= 0.5,1, 0)
+test_pred_rnn <- predict(modelRNN, x_test)
+test_pred_rnn<- ifelse(test_pred_rnn >= 0.5,1, 0)
+y_test <- as.numeric(as.character(y_test))
+y_predict <- as.numeric(as.character(y_predict))
+
+
+comp<- cbind(y_test, y_predict, test_pred_ann, test_pred_rnn)
+colnames(comp)<- c("Real", "Predicción MM", "Predicción M. denso", "Predicción LSTM")
+
+
+row.names(comp) <- row.names(comp)<- test_data$Eple
+
+comp
+
+
+
+```
+

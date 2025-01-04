@@ -1,0 +1,91 @@
+---
+title: "TRA_Data augmentation sequence analysis"
+author: "Leticia Arroyo Benito"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 2
+    toc_float:
+      collapse: no
+      smooth_scroll: yes
+---
+ 
+## matriz distancias
+```{r}
+#MSA procede de la matriz identidad de clustal omega
+msa <- read.csv("MSA_TRA_DA.csv", sep = ",")
+row.names(msa) <- msa$X
+msa$X <- NULL
+msa_matrix <- as.matrix(msa)
+msa_dist <- dist(msa_matrix)
+msa_dist_matrix <- as.matrix(msa_dist)
+library(reshape2)
+msa_dist_long <- melt(as.matrix(msa_dist_matrix), varnames = c("proteina1", "proteina2"), value.name = "distancia")
+#voy a eliminar resultados duplicados (dist entre a y b es la misma que entre b y a), y las distancias consigo mismas que ya h ecomprobado es 0.
+library(dplyr)
+
+msa_dist_long <- msa_dist_long %>%
+  mutate(
+    proteina1 = as.character(proteina1),
+    proteina2 = as.character(proteina2)
+  ) %>%
+  rowwise() %>%
+  mutate(
+    Proteina_min = min(proteina1, proteina2), 
+    Proteina_max = max(proteina1, proteina2) 
+  ) %>%
+  ungroup() %>%
+  distinct(Proteina_min, Proteina_max, .keep_all = TRUE) %>%  # Eliminar duplicados
+  select(proteina1, proteina2, distancia) 
+
+data <- msa_dist_long %>%  filter(proteina1 != proteina2) #dejo sólo las que son distintas
+
+
+```
+
+```{r}
+#las proteinas generadas son del tipo: EPLETT333.3
+# proteina origen = primeros 9 caracteres del nombre
+get_origen <- function(proteina) {
+  substr(proteina, 1, 9)
+}
+
+# proteína generada: punto tras los 9 primeros caracteres
+es_generada <- function(proteina) {
+  grepl("^.{9}\\.", proteina)
+}
+
+# Aplico xa obtener los orígenes y si son proteínas generadas
+data$origen1 <- sapply(data$proteina1, get_origen)
+data$origen2 <- sapply(data$proteina2, get_origen)
+data$generada1 <- sapply(data$proteina1, es_generada)
+data$generada2 <- sapply(data$proteina2, es_generada)
+
+#quiero comparar sólo las generadas no el total
+# Filtro las filas donde al menos una de las proteínas es generada
+data_generadas <- data[data$generada1 | data$generada2, ]
+
+# añado col xa proteínas con mismo origen
+data_generadas$mismo_origen <- data_generadas$origen1 == data_generadas$origen2
+
+#analizo las distancias
+# dos grupos: mismo origen y distinto origen
+distancias_mismo_origen <- data_generadas$distancia[data_generadas$mismo_origen]
+distancias_distinto_origen <- data_generadas$distancia[!data_generadas$mismo_origen]
+
+# Calculo el máximo de las distancias entre proteínas del mismo origen
+max_distancia_mismo_origen <- max(distancias_mismo_origen, na.rm = TRUE)
+
+# Filtro las que no cumplen
+proteinas_incumplen <- data_generadas[!data_generadas$mismo_origen & #seleccionando filas proteínas origen diferente Y
+                                        data_generadas$distancia <= max_distancia_mismo_origen, ] # donde la distancia entre las dos proteínas es menor o igual al máximo de las distancias calculadas entre proteínas con el mismo origen (caso más desfavorable)
+
+# Verificar si hay incumplimientos y mostrar resultados
+if (nrow(proteinas_incumplen) > 0) {
+  print("Proteínas generadas que no cumplen la condición:")
+  print(proteinas_incumplen)
+} else {
+  print("Todas las proteínas generadas cumplen la condición.")
+}
+```
+

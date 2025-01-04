@@ -1,0 +1,476 @@
+---
+title: "R Notebook"
+output:
+  pdf_document: default
+  html_notebook: default
+  html_document:
+    df_print: paged
+---
+
+# Datos: 
+pca_data viene de DF_preprocesing.Rmd (pca$x contiene todos lo CP)
+resultado_rltv viene de frecuencia_aminoacidos.Rmd
+He normalizado el valor de los CP para que estén todos entre 0 y 1
+data: concateno los valores de CP con one-hot de la secuencia, o con frecuencia relativa
+Los datos de frecuencia de cada uno de los aminoácidos no tienen en cuenta el orden, por lo que podría analizarlo como fully connected.
+```{r, include=FALSE}
+library(ggplot2)
+library(Biostrings)
+library(ggrepel)
+#library(ape)
+library(RColorBrewer)
+library(openxlsx)
+library(stats)
+library(writexl)
+library(dplyr)
+library(keras)
+```
+
+```{r, warning=FALSE}
+#PC
+pca <- read.csv("pca.csv")
+row.names(pca)<- pca$X
+pca$X<- NULL
+PC1_3<- as.data.frame(pca[, 1:3])
+#normalizo estos datos
+normalize <- function(x){
+return((x - min(x))/(max(x) - min(x)))
+}
+PC1_3_norm <- as.data.frame(lapply(PC1_3, normalize))
+row.names(PC1_3_norm) <- row.names(PC1_3)
+
+#datos frec relativa
+
+resultado_rltv <- read.csv( "resultado_rltv.csv")
+row.names(resultado_rltv)<- resultado_rltv$X
+resultado_rltv$X<- NULL
+
+resultado_rltv <- resultado_rltv[c(rownames(PC1_3)), ]#quito las que descarté para quedarme con las 97 
+data_frec <- as.data.frame(cbind(PC1_3_norm, resultado_rltv))
+
+
+```
+
+# Etiquetas:
+
+
+```{r}
+
+#Labels
+datos <- "aureus20241022.xlsx"
+dt<-data.frame(read.xlsx(datos))
+row.names(dt) <- dt$Eple
+label <- dt[, 20:22]
+label$Both <- ifelse(label$activ == "B", 1, 0)
+label$None <- ifelse(label$activ == "N", 1, 0)
+
+label_TRA<- label$TRA_activ
+label_GH<- label$GH_activ
+
+```
+
+# Training y test: Para los datos de frecuencias de aminoacidos
+
+```{r}
+# vector aleatorio para seleccionar el 80% de los datos 
+set.seed(123)
+indice_sel <- sample(1:nrow(data), size = 0.8*nrow(data_frec),replace=F)
+
+
+# Dividir datos en train y test
+dt_train <- data_frec[indice_sel, ]
+dt_test <- data_frec[-indice_sel, ]
+
+label_TRA_train <- label_TRA[indice_sel]
+label_TRA_test <- label_TRA[-indice_sel]
+
+label_GH_train <- label_GH[indice_sel]
+label_GH_test <- label_GH[-indice_sel]
+
+```
+# Conjunto de Validación
+
+un modelo de aprendizaje profundo nunca debe evaluarse en base a sus
+datos de entrenamiento: es una práctica estándar utilizar un conjunto de validación para monitorear la precisión del
+modelo durante el entrenamiento. Aquí, crearemos un conjunto de validación separando 20 muestras de los datos de entrenamiento originales.
+20 para validar y 57 para entrenar
+```{r, warning=FALSE}
+x_val <- dt_train[seq(20), ]
+x_train <- dt_train[-seq(20), ]
+y_val_TRA <- label_TRA_train[seq(20)]
+y_train_TRA <- label_TRA_train[-seq(20)]
+y_val_GH <- label_GH_train[seq(20)]
+y_train_GH <- label_GH_train[-seq(20)]
+
+
+y_train_GH
+
+```
+
+Convertir los datos en tensores
+```{r}
+
+dt_train <- as_tensor(x_train)
+dt_val <- as_tensor(x_val)
+dt_test <- as_tensor(dt_test)
+
+
+```
+
+# Construir el modelo
+Número de unidades: 23col (20AA y 3CP)
+Funcion de activación de rectificador lineal unitario, menos en la última capa que se cambia por una función de activación de tipo sigmoidal (el output será de tipo probabilidad, con un score entre 0 y 1)
+
+```{r, warning=FALSE}
+set.seed(123545)
+model <- keras_model_sequential() %>%
+layer_dense(23, activation = "relu") %>%
+layer_dense(1, activation = "sigmoid")
+
+#modelo 2 con drop out
+set.seed(123545)
+model2 <- keras_model_sequential() %>%
+layer_dense(23, activation = "relu") %>%
+layer_dropout(rate = 0.2) %>%
+layer_dense(1, activation = "sigmoid")
+
+
+```
+# Compilar
+función costes. Cross-entropy es habitualmente la mejor elección cuando se trabaja con modelos cuyo output son probabilidades. Pero no es la única, también sería posible usar por ejm mean_squared_error.
+Como optimizador usaremos rmsprop "default choice"
+
+```{r, warning=FALSE}
+set.seed(123545)
+model %>% compile(
+  loss = "binary_crossentropy",
+  optimizer = optimizer_rmsprop(),
+  metrics = c("accuracy")
+)
+
+```
+
+# Entrenamiento TRA
+
+entrenaremos el modelo:
+15 épocas (15 iteraciones sobre todas las muestras en los datos de entrenamiento). Al final de cada época hay una pequeña pausa en la que el modelo calcula su pérdida y precisión en las 20 muestras de datos de validación.
+Minilotes de 4 muestras. 
+Al mismo tiempo, monitorearemos la pérdida y la precisión en las 20 muestras que separamos (conjunto de validación). Lo hacemos pasando los
+datos de validación como argumento.validation_data
+
+
+```{r, warning=FALSE}
+set.seed(12345)
+history_TRA <- model %>% fit(
+dt_train,
+y_train_TRA,
+epochs = 15,
+batch_size = 4,
+validation_data = list(dt_val, y_val_TRA)
+)
+```
+
+
+
+```{r, warning=FALSE}
+
+str(history_TRA$metrics)
+plot(history_TRA)
+
+```
+Puedo bajar el número de épocas a 6 o 7 para evitar que sobreajuste
+Solo baja loss, pero no mejora accuracy
+Son pocos datos, h ehecho holdout validation, quizá mejor Iterated k-Fold validation with shuffling?
+```{r}
+predict_TRA <- model %>% predict(dt_test) 
+comp_TRA<-cbind(label_TRA_test, round(predict_TRA, 0))
+comp_TRA
+model %>% evaluate(dt_test, label_TRA_test,verbose = 0)
+
+
+```
+# Entrenamiento GH
+
+```{r, warning=FALSE}
+set.seed(123545)
+history_GH <- model %>% fit(
+dt_train,
+y_train_GH,
+epochs = 15,
+batch_size = 4,
+validation_data = list(dt_val, y_val_GH)
+)
+
+plot(history_GH)
+```
+
+Voy a bajar la tasa de aprendizaje porque sale fatal
+```{r}
+set.seed(123545)
+model %>% compile(
+  loss = "binary_crossentropy",
+  optimizer = optimizer_rmsprop(0.01),
+  metrics = c("accuracy")
+)
+
+set.seed(123545)
+history_GH <- model %>% fit(
+dt_train,
+y_train_GH,
+epochs = 15,
+batch_size = 4,
+validation_data = list(dt_val, y_val_GH)
+)
+plot(history_GH)
+
+```
+Tb mal
+Pruebo con el modelo con dropout (2%)
+```{r}
+set.seed(123545)
+model2 %>% compile(
+  loss = "binary_crossentropy",
+  optimizer = optimizer_rmsprop(0.01),
+  metrics = c("accuracy")
+)
+
+set.seed(123545)
+history_GH <- model2 %>% fit(
+dt_train,
+y_train_GH,
+epochs = 15,
+batch_size = 4,
+validation_data = list(dt_val, y_val_GH)
+)
+```
+
+```{r}
+str(history_GH$metrics)
+plot(history_GH)
+
+```
+No generaliza
+```{r}
+predict_GH <- model2 %>% predict(dt_test) 
+comp_GH<-cbind(label_GH_test, round(predict_GH, 0))
+comp_GH
+model2 %>% evaluate(dt_test, label_GH_test,verbose = 0)
+```
+# Iterated K-FOLD validation with Shuffling
+Recomendaddo para casos en que hay pocos datos disponibles. Consiste en aplicar K-fold validation multiples veces, mezclando cada vez antes de split en K ways. El score final es el promedio de los scores obtenidosen cada run de k-fold validation
+
+## TRA model
+```{r}
+
+k <- 5  # Número de folds
+n_repeats <- 3  # Número de iteraciones con barajado
+
+
+#  datos y etiquetas
+dt_data <- as.matrix(data_frec) 
+y_target <- as.numeric(label_TRA)
+
+# creo un vector vacio para guardar los resultados
+all_scores <- c()
+
+build_model <- function() {
+  keras_model_sequential() %>%
+    layer_dense(23, activation = "relu", input_shape = ncol(dt_data)) %>%
+    layer_dropout(rate = 0.2) %>%
+    layer_dense(1, activation = "sigmoid") %>%
+    compile(
+      loss = "binary_crossentropy",
+      optimizer = optimizer_rmsprop(),
+      metrics = c("accuracy")
+    )
+}
+
+# Iterar a través de las repeticiones
+for (rep in 1:n_repeats) {
+  cat("Repetition:", rep, "\n")
+  
+  # Barajar los datos
+  set.seed(rep)  # Cambiar la semilla para diferentes repeticiones
+  indices <- sample(1:nrow(dt_data))
+  dt_data <- dt_data[indices, ]
+  y_target <- y_target[indices]
+  
+  # Crear folds
+  fold_size <- floor(nrow(dt_data) / k)
+  for (i in 1:k) {
+    cat("Processing fold:", i, "\n")
+    
+    # Crear los datos de entrenamiento y validación para este fold
+    val_indices <- ((i - 1) * fold_size + 1):(i * fold_size)
+    dt_val <- dt_data[val_indices, ]
+    y_val <- y_target[val_indices]
+    
+    dt_train <- dt_data[-val_indices, ]
+    y_train <- y_target[-val_indices]
+    
+    # Construir el modelo
+    model <- build_model()
+    
+    # Entrenar el modelo
+    history <- model %>% fit(
+      dt_train,
+      y_train,
+      epochs = 15,
+      batch_size = 4,
+      validation_data = list(dt_val, y_val),
+      verbose = 0  # Cambiar a 1 si quieres ver los detalles de cada fold
+    )
+    
+    # Evaluar el modelo en el conjunto de validación
+    results <- model %>% evaluate(dt_val, y_val, verbose = 0)
+    all_scores <- c(all_scores, results[2]) # Usar results[2] para la precisión, [1] es la perdida
+  }
+}
+
+all_scores <- c(all_scores, results)
+cat("Mean accuracy:", mean(all_scores), "\n")
+cat("Standard deviation:", sd(all_scores), "\n")
+print(results)
+
+```
+Graficos
+```{r}
+
+# history es el resultado de model %>% fit
+# Extraer datos del historial
+df <- data.frame(
+  epoch = seq_along(history$metrics$loss),
+  loss = history$metrics$loss,
+  val_loss = history$metrics$val_loss,
+  accuracy = history$metrics$accuracy,
+  val_accuracy = history$metrics$val_accuracy
+)
+
+# Crear el gráfico para la pérdida (loss)
+plot_loss <- ggplot(df, aes(x = epoch)) +
+  geom_line(aes(y = loss, color = "Training Loss")) +
+  geom_line(aes(y = val_loss, color = "Validation Loss")) +
+  labs(title = "Model Loss", y = "Loss", x = "Epoch") +
+  scale_color_manual(values = c("Training Loss" = "blue", "Validation Loss" = "red")) +
+  theme_minimal()
+
+# Crear el gráfico para la precisión (accuracy)
+plot_accuracy <- ggplot(df, aes(x = epoch)) +
+  geom_line(aes(y = accuracy, color = "Training Accuracy")) +
+  geom_line(aes(y = val_accuracy, color = "Validation Accuracy")) +
+  labs(title = "Model Accuracy", y = "Accuracy", x = "Epoch") +
+  scale_color_manual(values = c("Training Accuracy" = "blue", "Validation Accuracy" = "red")) +
+  theme_minimal()
+
+# Mostrar los gráficos
+print(plot_loss)
+print(plot_accuracy)
+```
+
+## GH model
+```{r}
+
+k <- 5  # Número de folds
+n_repeats <- 3  # Número de iteraciones con barajado
+
+
+#  datos y etiquetas
+dt_data <- as.matrix(data_frec) 
+y_target <- as.numeric(label_GH)
+
+# creo un vector vacio para guardar los resultados
+all_scores <- c()
+
+build_model <- function() {
+  keras_model_sequential() %>%
+    layer_dense(23, activation = "relu", input_shape = ncol(dt_data)) %>%
+    layer_dropout(rate = 0.2) %>%
+    layer_dense(1, activation = "sigmoid") %>%
+    compile(
+      loss = "binary_crossentropy",
+      optimizer = optimizer_rmsprop(),
+      metrics = c("accuracy")
+    )
+}
+
+# Iterar a través de las repeticiones
+for (rep in 1:n_repeats) {
+  cat("Repetition:", rep, "\n")
+  
+  # Barajar los datos
+  set.seed(rep)  # Cambiar la semilla para diferentes repeticiones
+  indices <- sample(1:nrow(dt_data))
+  dt_data <- dt_data[indices, ]
+  y_target <- y_target[indices]
+  
+  # Crear folds
+  fold_size <- floor(nrow(dt_data) / k)
+  for (i in 1:k) {
+    cat("Processing fold:", i, "\n")
+    
+    # Crear los datos de entrenamiento y validación para este fold
+    val_indices <- ((i - 1) * fold_size + 1):(i * fold_size)
+    dt_val <- dt_data[val_indices, ]
+    y_val <- y_target[val_indices]
+    
+    dt_train <- dt_data[-val_indices, ]
+    y_train <- y_target[-val_indices]
+    
+    # Construir el modelo
+    model <- build_model()
+    
+    # Entrenar el modelo
+    history <- model %>% fit(
+      dt_train,
+      y_train,
+      epochs = 15,
+      batch_size = 4,
+      validation_data = list(dt_val, y_val),
+      verbose = 0  # Cambiar a 1 si quieres ver los detalles de cada fold
+    )
+    
+    # Evaluar el modelo en el conjunto de validación
+    results <- model %>% evaluate(dt_val, y_val, verbose = 0)
+    all_scores <- c(all_scores, results[2]) # Usar results[2] para la precisión, [1] es la perdida
+  }
+}
+
+all_scores <- c(all_scores, results)
+cat("Mean accuracy:", mean(all_scores), "\n")
+cat("Standard deviation:", sd(all_scores), "\n")
+print(results)
+
+```
+Graficos
+```{r}
+
+# history es el resultado de model %>% fit
+# Extraer datos del historial
+df <- data.frame(
+  epoch = seq_along(history$metrics$loss),
+  loss = history$metrics$loss,
+  val_loss = history$metrics$val_loss,
+  accuracy = history$metrics$accuracy,
+  val_accuracy = history$metrics$val_accuracy
+)
+
+# Crear el gráfico para la pérdida (loss)
+plot_loss <- ggplot(df, aes(x = epoch)) +
+  geom_line(aes(y = loss, color = "Training Loss")) +
+  geom_line(aes(y = val_loss, color = "Validation Loss")) +
+  labs(title = "Model Loss", y = "Loss", x = "Epoch") +
+  scale_color_manual(values = c("Training Loss" = "blue", "Validation Loss" = "red")) +
+  theme_minimal()
+
+# Crear el gráfico para la precisión (accuracy)
+plot_accuracy <- ggplot(df, aes(x = epoch)) +
+  geom_line(aes(y = accuracy, color = "Training Accuracy")) +
+  geom_line(aes(y = val_accuracy, color = "Validation Accuracy")) +
+  labs(title = "Model Accuracy", y = "Accuracy", x = "Epoch") +
+  scale_color_manual(values = c("Training Accuracy" = "blue", "Validation Accuracy" = "red")) +
+  theme_minimal()
+
+# Mostrar los gráficos
+print(plot_loss)
+print(plot_accuracy)
+```

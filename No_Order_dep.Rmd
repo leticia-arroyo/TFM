@@ -1,0 +1,155 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r librerias, include=FALSE}
+library(data.table)
+library(ggplot2)
+library(ggrepel)
+library(openxlsx)
+library(stats)
+library(reshape2)
+library(dplyr)
+library(stringr)
+library(tensorflow)
+library(reticulate)
+library(writexl)
+library(keras)
+library(readxl)
+
+```
+## datos
+
+```{r datos_tr_y_te}
+
+dt <- read_excel("df_GI_concat.xlsx")
+dt<-data.frame(dt)
+row.names(dt)<-dt$Eple
+test <- data.frame(read_excel("test_GI.xlsx"))
+Eple_test <- test$Name
+
+
+#Normalizo lo PC1 to 3
+pc_norm <- as.data.frame(lapply(dt[, c("PC1", "PC2", "PC3")], function(x) {
+  (x - min(x)) / (max(x) - min(x))
+}))
+#Cambio las orig por las normalizadas
+dt[, 4:6]<- NULL
+dt <- cbind(dt, pc_norm)
+
+
+
+train_data <- dt[!(rownames(dt) %in% Eple_test), ]
+
+set.seed(123)
+indice_sel <- sample(1:nrow(train_data), size = 0.8*nrow(train_data),replace=F)
+
+
+# Divido en train y val
+train_data <- train_data[indice_sel, ]
+val_data <- train_data[-indice_sel, ]
+test_data <- dt[rownames(dt) %in% Eple_test, ]
+
+y_train <- as.integer(train_data$Label)
+y_test <- as.integer(test_data$Label)
+y_val  <- as.integer(val_data$Label)
+
+
+```
+## Modelo ANN
+### Preparar datos
+```{r}
+x_train_PC<- train_data[, 4:6]
+x_val_PC<- val_data[, 4:6]
+x_test_PC<- test_data[, 4:6]
+#conversioin a tensores
+x_train_PC <- as_tensor(x_train_PC)
+x_val_PC <- as_tensor(x_val_PC)
+x_test_PC <- as_tensor(x_test_PC)
+
+```
+
+### Modelo
+```{r}
+#modelo ANN
+set.seed(123545) #usar lamisma inicialización de pesos
+modelANN <- keras_model_sequential() %>%
+layer_dense(3, activation = "relu") %>%  #Nº nodos = dimensionalidad = 3 PC, pero puedo añadir más
+layer_dropout(rate = 0.4) %>%
+layer_dense(1, activation = "sigmoid")
+
+#compilar
+modelANN %>% compile(
+  loss = "binary_crossentropy",
+  optimizer = optimizer_rmsprop(learning_rate = 0.001),
+  metrics = c("accuracy")
+)
+#entrenar
+set.seed(12345) #mismos batches
+historyANN <- modelANN %>% fit(
+x_train_PC,
+y_train,
+epochs = 20,
+batch_size = 32,
+validation_data = list(x_val_PC, y_val)
+)
+
+#str(historyANN$metrics)
+plot(historyANN)
+
+#save_model_hdf5(modelANN, "ANN_GI_modelo_entrenado.h5")
+```
+
+
+```{r}
+modelANN %>% evaluate(x_test_PC, y_test)
+y_predict <- predict(modelANN, x_test_PC)
+y_predict <- round(y_predict, 0)
+
+y_predict <- as.vector(y_predict)
+y_test <- as.vector(y_test)
+comp<- cbind(y_test, y_predict)
+colnames(comp)<- c("y_test", "y_predict")
+row.names(comp) <- c("EPLETT296", "EPLETT299", "EPLETT352", "EPLETT361", "EPLETT380", "EPLETT384", "EPLETT391", "EPLETT393", "EPLETT402", "EPLETT404", "EPLETT405", "EPLETT408", "EPLETT411", "EPLETT415", "EPLETT424", "EPLETT425", "EPLETT436", "EPLETT440", "EPLETT444", "EPLETT456")
+comp
+
+
+library(caret)
+#confusionMatrix()datos categóricos
+y_predict <- factor(y_predict, levels = c(0, 1))
+y_test <- factor(y_test, levels = c(0, 1))
+# matriz de confusión
+evalRNN <- confusionMatrix(y_predict, y_test,positive = "1")
+evalRNN
+```
+
+### Modelo ANN2
+Modelo con 2 capas ocultas.
+Peor
+```{r, include=FALSE}
+#modelANN2 <- keras_model_sequential() %>%
+#  layer_dense(units = 12, activation = "relu", input_shape = c(3)) %>%  # Primera capa 
+#  layer_dropout(rate = 0.3) %>%
+#  layer_dense(units = 6, activation = "relu") %>%  # Segunda capa 
+#  layer_dropout(rate = 0.3) %>%
+#  layer_dense(units = 1, activation = "sigmoid")  #  salida
+
+# Compilar
+#modelANN2 %>% compile(
+#  optimizer = optimizer_rmsprop(learning_rate = 0.001), #bajo el ratio de aprendizaje
+#  loss = "binary_crossentropy",
+#  metrics = c("accuracy")
+#)
+
+#fit
+#historyANN2 <- modelANN2 %>% fit(
+#x_train_PC,
+#y_train,
+#epochs = 20,
+#batch_size = 16,
+#validation_data = list(x_val_PC, y_val)
+#)
+#plot(historyANN2)
+
+```

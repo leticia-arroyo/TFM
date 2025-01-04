@@ -1,0 +1,160 @@
+---
+title: "LSTM_TRA"
+output:
+  pdf_document: default
+  html_notebook: default
+---
+
+# preparar datos
+```{r}
+library(openxlsx)
+library(stats)
+library(dplyr)
+library(stringr)
+library(tensorflow)
+library(reticulate)
+library(writexl)
+library(keras)
+
+#importo los datos
+train_data <- "train_TRA.xlsx"
+test_data <- "test_TRA.xlsx"
+train_data<-data.frame(read.xlsx(train_data))
+test_data<-data.frame(read.xlsx(test_data))
+
+set.seed(123)
+indice_sel <- sample(1:nrow(train_data), size = 0.8*nrow(train_data),replace=F)
+# Divido en train y val
+train_data <- train_data[indice_sel, ]
+val_data <- train_data[-indice_sel, ]
+
+
+
+# vocabulario
+vocab <- c("A", "C", "D", "E", "F", "G", "H", "I", "K", "L", 
+           "M", "N", "P", "Q", "R", "S", "T", "V", "W", "Y")
+
+
+max_len <- 271
+
+# Crear el vectorizador 
+text_vectorizer <- layer_text_vectorization(
+  standardize = NULL,                    # NO! x defecto a minusc y separa x espac en blanco
+  max_tokens = length(vocab) + 2,        # AA + UNK + 0(padding)
+  output_mode = "int",
+  output_sequence_length = max_len,
+  split = "character"                    # caracteres, no palabras
+)
+
+
+text_vectorizer %>% set_vocabulary(vocab)
+
+# confirm vocabulario del vectorizador
+#podría haberlo incluido como vocabulary = vocab
+
+print(text_vectorizer$get_vocabulary())
+
+#secuencias "text only"
+seq_train <- as.character(train_data$Sequence)
+seq_test <- as.character(test_data$Sequence)
+seq_val <- as.character(val_data$Sequence)
+
+# Aplico text_vectoricer a las secuencias
+vectorized_train <- text_vectorizer(seq_train)
+vectorized_test <- text_vectorizer(seq_test)
+vectorized_val <- text_vectorizer(seq_val)
+
+# confirmo salida
+print(vectorized_test[2])
+
+train_labels <- as.integer(train_data$Label)
+test_labels <- as.integer(test_data$Label)
+val_labels <- as.integer(val_data$Label)
+
+
+```
+# modelo
+```{r}
+library(keras)
+library(tensorflow)
+
+max_tokens <- 22 
+seq_length <- 271 
+# datos entrenamiento, validación y prueba
+x_train <- as.array(vectorized_train)  
+x_val <- as.array(vectorized_val)
+x_test <- as.array(vectorized_test)
+
+y_train <- train_labels
+y_val <- val_labels
+y_test <- test_labels
+
+#modelo
+inputs <- layer_input(shape = c(seq_length), dtype = "int64")
+
+embedded <- inputs %>%
+  tf$one_hot(depth = as.integer(max_tokens)) 
+
+outputs <- embedded %>%
+  bidirectional(layer_lstm(units = 32)) %>%  # bidirectional LSTM
+  layer_dropout(0.5) %>%
+  layer_dense(1, activation = "sigmoid")  # clasification layer
+
+model <- keras_model(inputs, outputs)
+
+
+model %>% compile(
+  optimizer = optimizer_rmsprop(),
+  loss = "binary_crossentropy",
+  metrics = "accuracy"
+)
+
+
+summary(model)
+
+# fit
+history <- model %>% fit(
+  x = x_train, y = y_train,
+  validation_data = list(x_val, y_val),
+  epochs = 25,
+  batch_size = 32
+)
+
+plot(history)
+
+
+#model %>% evaluate(x_test, y_test)
+
+model %>% evaluate(x_test, y_test)
+
+y_predict <- predict(model, x_test)
+y_predict <- round(y_predict, 0)
+
+y_predict <- as.vector(y_predict)
+y_test <- as.vector(y_test)
+comp<- cbind(y_test, y_predict)
+colnames(comp)<- c("y_test", "y_predict")
+row.names(comp) <- c("EPLETT296", "EPLETT299", "EPLETT352", "EPLETT361", "EPLETT380", "EPLETT384", "EPLETT391", "EPLETT393", "EPLETT402", "EPLETT404", "EPLETT405", "EPLETT408", "EPLETT411", "EPLETT415", "EPLETT424", "EPLETT425", "EPLETT436", "EPLETT440", "EPLETT444", "EPLETT456")
+comp
+
+
+library(caret)
+#confusionMatrix()datos categóricos
+y_predict <- factor(y_predict, levels = c(0, 1))
+y_test <- factor(y_test, levels = c(0, 1))
+# matriz de confusión
+evalRNN <- confusionMatrix(y_predict, y_test,positive = "1")
+evalRNN
+
+
+```
+## Guardar el modelo
+```{r}
+#save_model_hdf5(model, "TRA_modelo_entrenado.h5")
+
+
+# Para cargarlo más tarde:
+#modelo_cargado <- load_model_hdf5("TRA_modelo_entrenado.h5")
+```
+
+
