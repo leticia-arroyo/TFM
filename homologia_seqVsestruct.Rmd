@@ -1,0 +1,183 @@
+---
+title: "Homología secuencias Vs estructuras"
+author: "Leticia Arroyo Benito"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 2
+    toc_float:
+      collapse: no
+      smooth_scroll: yes
+---
+
+
+
+```{r librerias, include=FALSE}
+library(data.table)
+library(ggplot2)
+library(ggrepel)
+library(openxlsx)
+library(stats)
+library(reshape2)
+library(dplyr)
+```
+Dali sólo permite lotes de 64 proteinas, por lo que hice por separado las endolisinas (que son las que contienen todas las activas) y las VAL. No tengo datos de z-score de todo frente a todo, por tanto, hago esta comparación sólo para las del tipo endolisina
+
+```{r directorio, include=FALSE}
+setwd("C:/Leticia/master/TFM")
+```
+
+```{r endolisinas_seq, include=FALSE}
+datos <- "aureus20241022.xlsx"
+dt<-data.frame(read.xlsx(datos))
+dt <- subset(dt, Type == "Endolysin")
+dt <- dt[, c("activ", "Protein_sequence", "Domain_type", "Eple")]
+
+aa_seqs <- AAStringSet(dt$Protein_sequence)
+names(aa_seqs) <- dt$Eple
+writeXStringSet(aa_seqs, file="./aa_seqs_endolisinas.fasta")
+```
+
+
+```{r secuencias}
+msa <- read.csv("msa_endolisinas.csv", sep = ",")
+row.names(msa) <- msa$X
+msa$X <- NULL
+#create distance matrix
+#directly geneious identity matrix
+msa_matrix <- as.matrix(msa/100)
+
+msa_matrix_long <- melt(as.matrix(msa_matrix), varnames = c("Proteina1", "Proteina2"), value.name = "Ident")
+msa_matrix_long <- msa_matrix_long %>%
+  mutate(
+    Proteina1 = as.character(Proteina1),
+    Proteina2 = as.character(Proteina2)
+  ) %>%
+  rowwise() %>%
+  mutate(
+    Proteina_min = min(Proteina1, Proteina2), 
+    Proteina_max = max(Proteina1, Proteina2) 
+  ) %>%
+  ungroup() %>%
+  distinct(Proteina_min, Proteina_max, .keep_all = TRUE) %>%  # Eliminar duplicados
+  select(Proteina1, Proteina2, Ident) 
+
+msa_matrix_long <- msa_matrix_long %>%  filter(Proteina1 != Proteina2)
+```
+
+```{r estructuras}
+datos <- "Dali.xlsx"
+zscore<-data.frame(read.xlsx(datos, sheet = "Hoja1"))
+row.names(zscore) <- zscore$X1
+zscore$X1 <- NULL
+zscore_matrix_long <- melt(as.matrix(zscore), varnames = c("Proteina1", "Proteina2"), value.name = "z-score")
+zscore_matrix_long <- na.omit(zscore_matrix_long) #quito los NA de la parte sup del triangulo
+zscore_matrix_long <- zscore_matrix_long %>%  filter(Proteina1 != Proteina2) #quito los consigo mismos
+
+```
+
+```{r estandariz}
+#voy a estandarizar las columnas de las proteinas para que los pares de proteinas sean los mismos y en el mismo orden en los 2 df. pongo en proteina1 la más pequeña y en proteina2 la más grande
+secuencia <- msa_matrix_long
+estructura <- zscore_matrix_long
+
+secuencia <- secuencia %>%
+  mutate(
+    Proteina1_std = pmin(as.character(Proteina1), as.character(Proteina2)),
+    Proteina2_std = pmax(as.character(Proteina1), as.character(Proteina2))
+  )
+
+secuencia$Proteina1<-NULL
+secuencia$Proteina2<-NULL
+
+estructura <- estructura %>%
+  mutate(
+    Proteina1_std = pmin(as.character(Proteina1), as.character(Proteina2)),
+    Proteina2_std = pmax(as.character(Proteina1), as.character(Proteina2))
+  )
+
+estructura$Proteina1 <- NULL
+estructura$Proteina2 <- NULL
+
+union_df <- full_join(estructura, secuencia, 
+                      by = c("Proteina1_std", "Proteina2_std"))
+c <- c("zscore", "proteina1", "proteina2", "ident")
+colnames(union_df)<- c
+
+
+ggplot(union_df, aes(x=ident, y= zscore)) +
+  geom_point() + 
+    theme_minimal()
+```
+
+```{r}
+#añado al df union la info de actividad y de familia de dominio proteico, para hacer el grafico anterior según activ y dom
+
+union_df <- union_df %>%
+  left_join(dt %>% select(Eple, activ, Domain_type), by = c("proteina1" = "Eple"))
+  
+
+colnames(union_df)<- c("zscore", "proteina1", "proteina2", "ident", "p1_activ", "p1_Dom")
+
+#no me funciona el rename, me dice que activ no existe...
+#rename(union_df, p1_act = activ, p1_Dom = Domain_type)
+
+union_df <- union_df %>%
+  left_join(dt %>% select(Eple, activ, Domain_type), by = c("proteina2" = "Eple"))
+
+colnames(union_df) <- c("zscore", "proteina1", "proteina2", "ident", "p1_activ", "p1_Dom", "p2_activ", "p2_Dom")
+
+
+
+#Codicionales para dar una sóla categoría 
+
+#ACTIVIDAD
+union_df$p1_activ_simp <-ifelse(union_df$p1_activ == "N", 0, 1)
+union_df$p2_activ_simp <-ifelse(union_df$p2_activ == "N", 0, 1)
+
+union_df$activ <- ifelse(union_df$p1_activ_simp == 0 & union_df$p2_activ_simp == 0, "Neg", #ambas negativas
+                         ifelse((union_df$p1_activ_simp == 0 & union_df$p2_activ_simp) | 
+                                  (union_df$p2_activ_simp == 0 & union_df$p1_activ_simp) == 1, "Mix", "Pos")) 
+#mixto (una positiva y otra negativa), ambas positivas
+
+#FAMILIA DE DOMINIO PROTEICO
+union_df$dom <- ""
+union_df <- union_df %>%
+  mutate(dom = ifelse(p1_Dom == p2_Dom, p1_Dom, "Mix"))
+
+```
+
+```{r}
+ggplot(union_df, aes(x=ident, y= zscore, color = activ, shape = dom)) +
+  geom_point(size = 1.5) +
+  labs(title = "Identidad de secuencias Vs z-score de estructura",
+       x = "Identidad de secuencias",
+       y = "z-score de estructura") +
+  theme_minimal() +
+  scale_color_manual(values = c("Pos" = "coral1", "Mix" = colors()[563], "Neg" = "azure4"),
+                     labels = c("Pos" = "Ambas Activas", "Mix" = "Una activa y otra no", "Neg" = "Ambas No Activas")) +
+  scale_shape_manual(values = c("CHAP" = 15, "Peptidase" = 16, "Amidase_2" = 10, "Amidase_3" = 18, "UNK" = 17, "Phage_lysozyme" = 2, "Other" = 4, "Mix"=1 )) +
+  guides(color = guide_legend(title = "Tipo de Actividad"))+
+  guides(shape = guide_legend(title = "Tipo de Dominio"))+
+  theme(legend.position = "right")
+
+
+```
+la zona de dominios diferentes ("Mix"), son las más diferentes estre sí.
+```{r}
+ggplot(union_df, aes(x=ident, y= zscore, color = activ, shape = dom)) +
+  geom_point(size = 1.5) +
+  labs(title = "Identidad de secuencias Vs z-score de estructura",
+       x = "Identidad de secuencias",
+       y = "z-score de estructura") +
+  theme_minimal() +
+  scale_color_manual(values = c("Pos" = "coral1", "Mix" = "blue", "Neg" = "azure4"),
+                     labels = c("Pos" = "Ambas Activas", "Mix" = "Una activa y otra no", "Neg" = "Ambas No Activas")) +
+  scale_shape_manual(values = c("CHAP" = 15, "Peptidase" = 16, "Amidase_2" = 10, "Amidase_3" = 18, "UNK" = 17, "Phage_lysozyme" = 2, "Other" = 4, "Mix"=1 )) +
+  guides(color = guide_legend(title = "Tipo de Actividad"))+
+  guides(shape = guide_legend(title = "Tipo de Dominio"))+
+  xlim(0, 0.13)+ylim(0, 0.12)+
+  theme(legend.position = "right")
+```
+
