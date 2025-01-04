@@ -1,0 +1,101 @@
+---
+title: "Data augmentation TRA"
+output: html_notebook
+---
+
+
+
+```{r}
+library(openxlsx)
+library(stats)
+library(dplyr)
+library(stringr)
+library(tensorflow)
+library(reticulate)
+library(writexl)
+
+#importo los datos
+datos <- "aureus20241022.xlsx"
+dt<-data.frame(read.xlsx(datos))
+row.names(dt) <- dt$Eple
+dt <- dt[, c("Protein_sequence","activ")]
+#ronombro las columnas para que me coincidan con el código 
+colnames(dt) <- c("Sequence", "Label")
+dt$Label<-ifelse(dt$Label == 'T' | dt$Label == 'B', 1, 0)
+#Compruebo que son correctas
+a<- filter(dt, dt$Label==1)
+
+# vector aleatorio para seleccionar el 80% de los datos 
+set.seed(123)
+indice_sel <- sample(1:nrow(dt), size = 0.8*nrow(dt),replace=F)
+
+
+# Dividir datos en train y test
+train_set <- dt[indice_sel, ]
+test_set <- dt[-indice_sel, ]
+
+```
+
+```{r}
+# Definir la función dict_aa_oversample
+dict_aa_oversample_2 <- function(train_set, test_set, max_len = 271, p_sub = 0.05) {
+  
+  # Copiar los conjuntos de entrenamiento y prueba
+  train_copy <- train_set
+  test_copy <- test_set
+  
+  # Truncar las secuencias al máximo definido por max_len
+  train_copy$Sequence <- substr(train_copy$Sequence, nchar(train_copy$Sequence) - max_len + 1, nchar(train_copy$Sequence))
+  test_copy$Sequence <- substr(test_copy$Sequence, nchar(test_copy$Sequence) - max_len + 1, nchar(test_copy$Sequence))
+  
+  # Separar los conjuntos positivos y negativos
+  train_pos <- train_copy[train_copy$Label == 1, ]
+  train_neg <- train_copy[train_copy$Label == 0, ]
+  
+  # Oversampling de la clase positiva para balancear con la clase negativa
+  train_pos <- train_pos[sample(1:nrow(train_pos), size = nrow(train_neg), replace = TRUE), ]
+  
+  pos_lists <- train_pos$Sequence
+  
+  # Diccionario de sustitución de aminoácidos
+  aa_sub_dict <- list(
+    "A" = "V", "S" = "T", "F" = "Y", "K" = "R", 
+    "C" = "M", "D" = "E", "N" = "Q", "V" = "I", 
+    "T" = "S", "Y" = "F", "R" = "K", "M" = "C", 
+    "E" = "D", "Q" = "N", "I" = "V"
+  )
+  
+  # Función para realizar sustituciones de aminoácidos
+
+  mutate_sequence <- function(seq, p_sub, aa_sub_dict) {
+    sapply(strsplit(seq, NULL)[[1]], function(aa) {
+      if (runif(1) < p_sub && !is.null(aa_sub_dict[[aa]])) {
+        return(aa_sub_dict[[aa]])
+      }
+      return(aa)
+    }) %>%
+      paste0(collapse = "")
+  }
+  
+  # Aplicar sustituciones a las secuencias positivas
+  pos_lists <- sapply(pos_lists, mutate_sequence, p_sub = p_sub, aa_sub_dict = aa_sub_dict)
+  
+  # Actualizar las secuencias en train_pos
+  train_pos$Sequence <- pos_lists
+  
+  # Combinar nuevamente train_pos y train_neg
+  train_copy <- rbind(train_pos, train_neg)
+   
+  
+  return(list(train_copy = train_copy, test_copy = test_copy))
+}
+
+result_2 <- dict_aa_oversample_2(train_set, test_set, max_len = 271, p_sub = 0.05)
+
+train_processed_2 <- result_2$train_copy
+test_processed_2 <- result_2$test_copy
+
+
+```
+
+
