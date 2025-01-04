@@ -1,0 +1,422 @@
+---
+title: "DF preprocesing"
+author: "Leticia Arroyo Benito"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 2
+    toc_float:
+      collapse: no
+      smooth_scroll: yes
+---
+
+Tenemos un dataframe con variables categóricas y numéricas, y queremos:
+Ver la interacción de estas variables con la variable respuesta de actividad.
+Reducir la dimensionalidad, y si es oportuno incluir alguno de los CP como entrada del DL model.
+
+Al tener variables de dif tipo, voy a plantear 2 opciones:
+1: Analizar por separado numéricos y categóricos (PCA y correspondencias)
+2: Codificar los categóricos y analizar de forma conjunta
+
+Las variables numéricas están más relacionadas con prop fisicoquímicas de las seq, mientras que las categóricas con el tipo de proteina, fam dominio, estruc sec...
+```{r, include=FALSE}
+
+library(openxlsx)
+library(stats)
+library(dplyr)
+
+#importo los datos
+setwd("C:/Leticia/master/TFM")
+datos <- "aureus20241022.xlsx"
+
+dt<-data.frame(read.xlsx(datos))
+#selecciono los campos que a priori voy a usar
+dt <- dt[, c(1, 4, 6, 11, 12, 13, 14, 15, 16, 17, 18, 19, 22, 28, 29, 30, 31, 32, 33, 34)]
+dt
+colnames(dt)
+#Acorto nombres de algunos campos
+colnames(dt)[6]<- "ch_neta"
+colnames(dt)[8]<- "%_acid"
+colnames(dt)[9]<- "%_basic"
+colnames(dt)[10]<- "%_charg"
+colnames(dt)[11]<- "%_p_unch"
+colnames(dt)[12]<- "%_p_hydp"
+colnames(dt)[15]<- "Alip_I"
+colnames(dt)[16]<- "Instb_I"
+num_dt <- dt[sapply(dt, is.numeric)]
+cat_dt <- dt[sapply(dt, is.character)]
+
+str(num_dt)
+summary(num_dt)
+
+str(cat_dt)
+```
+# NUMERICAS
+## PCA:
+Examinamos la interdependencia entre las variables.
+Var numéricas, para las cualitativas, mejor análisis de correspondencia.
+
+Verificación de supuestos:
+Análisis adecuado para N>50. Tenemos 97 muestras y 14 variables (numéricas) de c.u.
+Existencia de correlaciones significativas entre las variables originales para poder reducir la dimensionalidad
+
+
+### Normalidad de Shapiro-Wilk multivariante
+Verificar si los datos se ajustan a una distribución normal multivariante.
+
+mshapiro.test() requiere que los datos estén transpuestos  para que cada fila represente una variable y cada columna una observación. 
+```{r, warning=FALSE, cache=TRUE, echo=FALSE}
+library(mvnormtest)
+m_num_dt <- as.matrix(num_dt)
+t_num_dt <- t(m_num_dt)
+mshapiro.test(t_num_dt)
+
+```
+p < 0.05: Se rechaza la hipótesis nula de normalidad multivariante, los datos no siguen una distribución normal multivariante.
+
+El análisis de componentes principales no requiere estrictamente normalidad para ser aplicable, pero cuando los datos son aproximadamente normales, los componentes principales pueden tener interpretaciones más claras
+
+Si los datos no son normales, el PCA puede verse afectado, sobre todo si existen outliers o asimetrías importantes, ya que estos pueden influir excesivamente en la varianza pudiendo dar lugar a componentes que no representan bien la estructura de los datos.
+
+Opciones:
+Transformaciones de datos para acercar las variables a una distribución normal.
+Métodos robustos de PCA, que son menos sensibles a la falta de normalidad y a los outliers. 
+Análisis de componentes principales basado en la matriz de correlación: Si las variables tienen escalas diferentes o si la falta de normalidad es un problema, el PCA sobre la matriz de correlación en lugar de la matriz de covarianzas puede ofrecer una mejor representación de los datos, que si se basara en la varianza y la covarianza de las variables.
+Usar la matriz de correlaciones equivale a aplicar PCA a los datos tipificados(mean=0, SD=1)
+
+
+### Correlación
+Matriz de correlaciones (numérica, y gráfica).
+Estadístico: test de esfericidad de Bartlett verifica si la matriz de correlación es una matriz identidad. Es decir, si hay redundancia entre variables que se pueden resumir con algunos factores. 
+
+
+
+```{r, warning=FALSE, cache=TRUE, echo=FALSE}
+library(psych)
+library(corrplot)
+R <- cor(num_dt)
+R
+corrplot(R)
+print(cortest.bartlett(R, n = nrow(num_dt)))
+
+```
+Confirmamos por tanto la existencia de correlaciones significativas entre algunas de las variables de partida (ejm: punto isoeléctrico y carga neta 0.92, o el % de hydrofóbicos con el índice gravy)
+bartlett: p < 0.05: Se rechaza la hipótesis nula, lo que sugiere que las variables están correlacionadas y es razonable aplicar el ACP.
+
+### PCA basado en la matriz de correlación
+
+```{r, warning=FALSE, cache=TRUE, echo=FALSE}
+#Varianza de cada variable
+apply(num_dt, 2, var)
+row.names(num_dt)<-dt$Eple
+#escalado, porque están en diferente escala
+#al centrar, resto la media
+#al escalar, divido por SD
+pca <- prcomp(num_dt, scale = TRUE, center = TRUE)
+summary(pca)
+#Autovalores
+e<- eigen(R)$val
+round(e, 3)
+#Gráfico de sedimentación
+plot(e, type="b", pch=20, col="blue", lwd=2, main="Gráfico de sedimentación", ylab="Eigen value", xlab = "Nº de componentes")+
+abline(h=1, lwd=2, col="red")
+```
+
+Los 14 factores creados son combinaciones lineales de las variables originales, independientes entre sí.
+¿Cuantos componentes elegir?
+a)nº de comp que explique al menos el 60%. Según este criterio 3 comp podría ser adecuado
+1er comp explica 28.6% de la varianza
+1+2: 51.5%
+1+2+3: 71.4%
+b) autovalor>1. Según este criterio podríamos usar los 4 primeros (en cuyo caso la var explicada acumulada es del 85.15%)
+c) componentes previos a la zona de sedimentación.
+Nos quedaríamos también con 4 componentes
+
+```{r, warning=FALSE, cache=TRUE, echo=FALSE}
+
+#info de las variables escaladas (factor de escala usados)
+pca$scale
+#media de cada var en el original
+pca$center
+#matriz de rotación (cargas)
+pca$rotation
+#proporción de varianza explicada por cada componente
+var_exp <- (pca$sdev^2)/sum(pca$sdev^2)
+cargas <- pca$rotation
+contribucion <- as.data.frame((cargas^2) %*% diag(var_exp))
+colnames(contribucion) <- colnames(pca$rotation)  # 
+contribucion
+
+
+biplot(x = pca, scale = 0, cex = 0.8, col =c("white", "darkgreen"), xlim = c(-6, 6), ylim = c(-6, 6))+
+  abline(h=0, v=0)
+
+
+```
+Grafico biplot 
+PC1 Vs PC2
+```{r, warning=FALSE, cache=TRUE, echo=FALSE}
+library(ggplot2)
+library(dplyr)
+
+
+#grafico 2 comp Activas/No activas
+pca_data <- as.data.frame(pca$x[, 1:2])
+colnames(pca_data) <- c("PC1", "PC2") 
+pca_data <- pca_data %>%
+  mutate(Label = rownames(num_dt),                    # Agregar los nombres de las filas como etiquetas
+         Color = ifelse(Label %in% c("EPLETT377","EPLETT378", "EPLETT379", "EPLETT382", "EPLETT391", "EPLETT398", "EPLETT405", "EPLETT296", "EPLETT434", "EPLETT438", "EPLETT451", "EPLETT440", "EPLETT423"), "activas", "no activas"))  
+
+ggplot(pca_data, aes(x = PC1, y = PC2, label = Label)) +
+  geom_point(aes(color = Color), size = 3) +                    # Puntos en el gráfico
+  geom_text(aes(color = Color), vjust = -1, hjust = 0.5, size = 3, show.legend = FALSE) +      # Etiquetas con colores:
+  scale_color_manual(values = c("activas" = "red",            # Color rojo para activas
+                                "no activas" = "gray")) +           # Color gris no activas
+  labs(title = "Biplot de PC1 Vs PCA2", x = "PC1", y = "PC2") +         
+  theme_minimal() 
+
+
+
+
+#grafico 2 comp Endolisinas /VAL
+pca_data <- pca_data %>%
+  mutate(Label2 = dt$Type,                    
+         Color2 = ifelse(Label2 %in% c("Endolysin"), "Endolysin", "VAL"))  
+
+ggplot(pca_data, aes(x = PC1, y = PC2, label = Label2)) +
+  geom_point(aes(color = Color2), size = 3) +                    
+  scale_color_manual(values = c("Endolysin" = "darkturquoise",            
+                                "VAL" = "coral1")) +         
+  labs(title = "Biplot de PC1 Vs PCA2", x = "PC1", y = "PC2") +  
+  guides(color = guide_legend(title = "Tipo de lisina "))+
+  theme_minimal()
+```
+
+296, 451, y 438 son solo activas en Growth inhibition. Grafico según tipo de actividad:
+```{r, warning=FALSE, cache=TRUE, echo=FALSE}
+
+pca_data <- pca_data %>%
+  mutate(Label = dt$activ,                    # Agregar los nombres de las filas como etiquetas
+         Color = ifelse(Label %in% c("G"), "Growth Inhibition", 
+                        (ifelse(Label %in% c("T"), "TRA", 
+                                (ifelse(Label %in% c("B"), "Both", "No activa"))))))  
+
+ggplot(pca_data, aes(x = PC1, y = PC2, label = Label)) +
+  geom_point(aes(color = Color), size = 3) +                    # Puntos en el gráfico
+  geom_text(aes(color = Color), vjust = -1, hjust = 0.5, size = 3, show.legend = FALSE) +      # Etiquetas con colores:
+  scale_color_manual(values = c("Both" = "red", 
+                                "Growth Inhibition" = "blue",
+                                "TRA" = "darkgreen",
+                                "No activa" = "gray")) +          
+  labs(title = "Biplot de PC1 Vs PCA2", x = "PC1", y = "PC2") +   
+  guides(color = guide_legend(title = "Tipo de Actividad"))+
+  theme_minimal()
+
+
+
+
+pca_data$V <- dt$activ
+pca_data$Z <- dt$Domain_type
+
+ggplot(pca_data, aes(x = PC1, y = PC2, color = V, shape = Z)) +
+  geom_point(size = 3) +
+  labs(title = "Biplot de PC1 Vs PCA2",
+       x = "PC1",
+       y = "PC2") +
+  theme_minimal() +
+  scale_color_manual(values = c("B" = "coral1", "G" = "blue", "N" = "azure4", "T" = "darkgoldenrod1"),
+                     labels = c("B" = "Both", "G" = "Growth Inhibition", "T" = "TRA", "N" = "No Activa")) +
+  scale_shape_manual(values = c("CHAP" = 15, "Peptidase" = 16, "Amidase_2" = 10, "Amidase_3" = 18, "UNK" = 17, "Phage_lysozyme" = 2, "Other" = 4)) +
+  guides(color = guide_legend(title = "Tipo de Actividad"))+
+  guides(shape = guide_legend(title = "Tipo de Dominio"))+
+  theme(legend.position = "right")
+
+```
+
+
+
+
+
+
+PC1 Vs PC3
+```{r, warning=FALSE, cache=TRUE, echo=FALSE}
+#grafico 2 comp
+pca_data2 <- as.data.frame(pca$x[, c(1, 3)])
+colnames(pca_data2) <- c("PC1", "PC3") 
+pca_data2 <- pca_data2 %>%
+  mutate(Label = rownames(num_dt),                    # Agregar los nombres de las filas como etiquetas
+         Color = ifelse(Label %in% c("EPLETT377","EPLETT378", "EPLETT379", "EPLETT382", "EPLETT391", "EPLETT398", "EPLETT405", "EPLETT296", "EPLETT434", "EPLETT438", "EPLETT451", "EPLETT440", "EPLETT423"), "activas", "no activas"))  
+
+ggplot(pca_data2, aes(x = PC1, y = PC3, label = Label)) +
+  geom_point(aes(color = Color), size = 3) +                    # Puntos en el gráfico
+  geom_text(aes(color = Color), vjust = -1, hjust = 0.5, size = 3, show.legend = FALSE) +      # Etiquetas con colores:
+  scale_color_manual(values = c("activas" = "red",            # Color rojo para activas
+                                "no activas" = "gray")) +           # Color gris no activas
+  labs(title = "Biplot de PC1 Vs PCA3", x = "PC1", y = "PC3") +         
+  theme_minimal() 
+
+#grafico 2 comp Endolisinas /VAL
+pca_data2 <- pca_data2 %>%
+  mutate(Label2 = dt$Type,                    # Agregar los nombres de las filas como etiquetas
+         Color2 = ifelse(Label2 %in% c("Endolysin"), "Endolysin", "VAL"))  
+
+ggplot(pca_data2, aes(x = PC1, y = PC3, label = Label2)) +
+  geom_point(aes(color = Color2), size = 3) +                    # Puntos en el gráfico
+  #geom_text(aes(color = Color), vjust = -1, hjust = 0.5, size = 3, show.legend = FALSE) +      # Etiquetas con colores:
+  scale_color_manual(values = c("Endolysin" = "darkturquoise",            # Color rojo para activas
+                                "VAL" = "coral1")) +           # Color gris no activas
+  labs(title = "Biplot de PC1 Vs PCA3", x = "PC1", y = "PC3") +         
+  theme_minimal()
+```
+
+
+
+
+1 Vs 3 NO
+
+Gráfico 3D
+PC1, PC2, PC3
+```{r, warning=FALSE, cache=TRUE, echo=FALSE}
+library(scatterplot3d)
+Categoria = factor(dt$activ,
+                   levels = c("B", "G", "N", "T"),
+                   labels = c("Both", "Growth inhibition", "None", "TRA"))
+
+
+
+pca_data3 <- data.frame(PC1 = pca$x[, 1],
+                       PC2 = pca$x[, 2],
+                       PC3 = pca$x[, 3],
+                       Categoria = Categoria)
+
+colores <- c("coral1", "blue",  "azure4",  "darkgoldenrod1")  # Puedes ajustar los colores
+pca_data3$Color <- colores[as.numeric(as.factor(pca_data3$Categoria))]
+
+scatterplot3d(pca_data3$PC1, pca_data3$PC2, pca_data3$PC3,
+              xlab = "PC1", ylab = "PC2", zlab = "PC3",
+              color = pca_data3$Color, pch = 19, 
+              main = "Primeros Tres Componentes del PCA ")
+
+# Añadir una leyenda para las categorías
+legend("topright", legend = levels(as.factor(pca_data3$Categoria)), 
+       col = colores, pch = 19, title = "Tipo de actividad")
+
+```
+
+
+# MIXTO
+cofificación de las factoriales
+```{r, include=FALSE}
+
+dt<-data.frame(read.xlsx(datos))
+#selecciono los campos que a priori voy a usar
+dt <- dt[, c(1, 4, 6, 11, 12, 13, 14, 15, 16, 17, 18, 19, 22, 28, 29, 30, 31, 32, 33, 34)]
+colnames(dt)[6]<- "ch_neta"
+colnames(dt)[8]<- "%_acid"
+colnames(dt)[9]<- "%_basic"
+colnames(dt)[10]<- "%_charg"
+colnames(dt)[11]<- "%_p_unch"
+colnames(dt)[12]<- "%_p_hydp"
+colnames(dt)[15]<- "Alip_I"
+colnames(dt)[16]<- "Instb_I"
+row.names(dt)<-dt$Eple
+dt$Eple<- NULL
+
+colnames(dt)
+dt <- dt %>% mutate(Type = ifelse(Type == "VAL", 0, 1))
+dt <- dt %>% mutate(Estabilidad = ifelse(Estabilidad == "unstable", 0, 1))  
+
+
+library(caret)
+# Codifico onehot el tipo de dominio
+dummies <- dummyVars(~ Domain_type, data = dt)
+dt_one_hot <- predict(dummies, newdata = dt)
+dt_one_hot <- as.data.frame(dt_one_hot)
+#renombro las columnas
+colnames(dt_one_hot)<-c("Amidase2", "Amidase3", "Chap", "Other", "Peptidase", "Phage_lysoz", "Unk")
+
+
+dummies2 <- dummyVars(~ Sec_struct, data = dt)
+ss_one_hot <- predict(dummies2, newdata = dt)
+ss_one_hot <- as.data.frame(ss_one_hot)
+colnames(ss_one_hot)<-c("a", "b", "c")
+
+#unifico en un dataframe
+dt_cod <- cbind(dt, dt_one_hot, ss_one_hot)
+dt_cod$Domain_type<- NULL
+dt_cod$Sec_struct <- NULL
+#He codificado todas las variables menos activ que es la respuesta
+
+
+
+```
+
+```{r, warning=FALSE, cache=TRUE, echo=FALSE}
+#quito var respuesta
+dt_cod$activ <- NULL
+
+R2 <- cor(dt_cod)
+R2
+corrplot(R2)
+
+
+
+
+pca2 <- prcomp(dt_cod, scale = TRUE)
+summary(pca2)
+#Autovalores
+e2<- eigen(R2)$val
+round(e2, 3)
+
+```
+Los resultados son peores que si sólo tengo en cuenta los numéricos
+
+# CATEGORICAS
+## Análisis de correspondencias múltiples
+
+```{r, warning=FALSE, cache=TRUE, echo=FALSE}
+setwd("C:/Leticia/master/TFM")
+datos <- "aureus20241022.xlsx"
+dt<-data.frame(read.xlsx(datos))
+#selecciono los campos que a priori voy a usar
+dt <- dt[, c(1, 4, 6, 11, 12, 13, 14, 15, 16, 17, 18, 19, 22, 28, 29, 30, 31, 32, 33, 34)]
+cat_dt <- dt[sapply(dt, is.character)]
+rownames(cat_dt)<-cat_dt$Eple
+cat_dt$Eple<-NULL
+library(FactoMineR)
+library(factoextra)
+
+cat_dt$Type <- as.factor(cat_dt$Type)
+cat_dt$Domain_type <- as.factor(cat_dt$Domain_type)
+cat_dt$Estabilidad <- as.factor(cat_dt$Estabilidad)
+cat_dt$Sec_struct <- as.factor(cat_dt$Sec_struct)
+cat_dt$activ <- as.factor(cat_dt$activ)
+
+mca_result <- MCA(cat_dt, quali.sup = 3, graph = FALSE)  # Especifica "activ" (var 3) como variable suplementaria, no se usa para construir los ejes principales, pero se proyecta en el espacio resultante para ver cómo se asocia con el resto de variables
+
+summary(mca_result)
+
+
+fviz_mca_var(mca_result, 
+             repel = TRUE,  
+             col.var = "cos2", # Color por calidad de representación
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"))
+
+
+
+```
+
+
+
+cos2 (o coseno cuadrado) mide la calidad de representación de cada categoría en el espacio de los componentes principales, es decir cuánto de la variabilidad total de una categoría se explica por el componente principal en que está proyectada (rango de 0 a 1)
+
+Valores cercanos a 1(rojo): La categoría está bien representada en ese componente.
+Valores bajos (cercanos a 0, azul): La categoría no está bien representada en ese componente, es decir, su contribución en esa dimensión es limitada y puede estar dispersa en otras dimensiones.
+
+contrib: Permite identificar las categorías que más contribuyen a cada dimensión o componente principal
+
+
+Las categorías que están cerca entre sí en el gráfico tienen una asociación o afinidad, por tanto, si activ se proyecta cerca de ciertas categorías de las variables activas, indica que esas categorías podrían estar relacionadas con ciertos niveles de activ.
+
+

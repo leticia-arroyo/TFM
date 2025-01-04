@@ -1,0 +1,89 @@
+---
+title: "frec_aminoácidos"
+output: html_notebook
+---
+
+
+
+```{r, librerías y wd}
+library(tm)
+library(openxlsx)
+library(stats)
+library(writexl)
+library(dplyr)
+setwd("C:/Leticia/master/TFM")
+datos <- "oneh.xlsx"
+dt<-data.frame(read.xlsx(datos))
+dt <- data.frame(dt$Name, dt$Protein_sequence)
+
+```
+En el df original, cada entrada tiene 2 campos, el nombre y la secuencia.
+Voy a crear un campo para cada aminoácido, y voy a indicar el número de veces que aparece ese aminoácido en la secuencia.
+
+```{r frecuencia_total}
+
+secuencias <- as.vector(dt$dt.Protein_sequence)
+
+
+# Función para calcular la frecuencia TOTAL de aminoácidos en cada secuencia
+calcular_frecuencia_por_secuencia <- function(secuencias) {
+  
+  # Crear un vector con los 20 aminoácidos estándar
+  aminoacidos <- c("A", "R", "N", "D", "C", "Q", "E", "G", "H", "I", "L", "K", "M", "F", "P", "S", "T", "W", "Y", "V")
+  #aminoacidos <- strsplit("ACDEFGHIKLMNPQRSTVWY", "")[[1]]
+  
+  # Crear una lista para almacenar las frecuencias de cada secuencia
+  #lapply para iterer sobre cada secuencia
+  frecuencias_lista <- lapply(secuencias, function(seq) {
+    # Calcular la frecuencia de cada aminoácido en la secuencia actual
+    frecuencia <- sapply(aminoacidos, function(aa) {
+      sum(strsplit(seq, "")[[1]] == aa)
+    })
+    return(frecuencia)
+  })
+  
+  # Convertir la lista de frecuencias a un data frame
+  frecuencias_df <- do.call(rbind, frecuencias_lista)
+  colnames(frecuencias_df) <- aminoacidos
+  rownames(frecuencias_df) <- dt$dt.Name
+  return(frecuencias_df)
+}
+
+# Calcular y mostrar las frecuencias por secuencia
+resultado <- calcular_frecuencia_por_secuencia(secuencias)
+print(resultado)
+
+```
+```{r frecuencia relativa}
+# frecuencia RELATIVA 
+calcular_frecuencia_relativa <- function(secuencias) {
+  # Crear un vector con los 20 aminoácidos estándar
+  aminoacidos <- c("A", "R", "N", "D", "C", "Q", "E", "G", "H", "I", "L", "K", "M", "F", "P", "S", "T", "W", "Y", "V")
+  
+  # lista para almacenar las frecuencias relativas
+  frecuencias_lista <- lapply(secuencias, function(seq) {
+    # Calcular la longitud de la secuencia
+    longitud <- nchar(seq)
+    
+    # Calcular la frecuencia de cada aminoácido en la secuencia actual
+    frecuencia <- sapply(aminoacidos, function(aa) {
+      sum(strsplit(seq, "")[[1]] == aa) / longitud
+    })
+    return(frecuencia)
+  })
+  
+  # Convertir la lista de frecuencias a un data frame
+  frecuencias_rltva_df <- do.call(rbind, frecuencias_lista)
+  colnames(frecuencias_rltva_df) <- aminoacidos
+  rownames(frecuencias_rltva_df) <- dt$dt.Name
+  
+  return(frecuencias_rltva_df)
+}
+
+# Calcular y mostrar las frecuencias relativas por secuencia
+resultado_rltv <- calcular_frecuencia_relativa(secuencias)
+print(round(resultado_rltv, 3))
+
+```
+
+
