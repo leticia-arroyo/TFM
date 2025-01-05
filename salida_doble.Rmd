@@ -1,0 +1,283 @@
+---
+title: "modelo CV doble salida"
+author: "Leticia Arroyo Benito"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: '2'
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float:
+      collapse: false
+      smooth_scroll: true
+---
+```{r, include=FALSE}
+library(data.table)
+library(ggplot2)
+library(ggrepel)
+library(openxlsx)
+library(stats)
+library(reshape2)
+library(dplyr)
+library(stringr)
+library(tensorflow)
+library(reticulate)
+library(writexl)
+library(keras)
+library(caret) 
+
+```
+
+## Datos de entrada
+```{r}
+dt <-"df_global_modelos.xlsx"
+dt<-data.frame(read.xlsx(dt))
+row.names(dt)<-dt$Name
+str(dt)
+
+table(dt$Label_GI)
+table(dt$Label_TRA)
+
+#Las X son proteinas de data augmentation que están sólo en uno de los 2 dataframe Ejm, EpleTT378 en el conjunto TRA se aumentaron 19, mientras que en el de GI 16, esas 3 extra no están testadas en los modelos anteriores de GI, pero son derivadas de una activa en GI, por tanto, voy a transformarlas de X en 1, pero dejo el archivo original sin tocar para saber cuales son
+
+dt$Label_GI <- ifelse(dt[, 3] == "X", "1", dt[, 3])
+dt$Label_TRA <- ifelse(dt[, 4] == "X", "1", dt[, 4])
+
+#Defino las etiquetas
+y_train_TRA <- as.integer(dt$Label_TRA)
+y_train_GI <- as.integer(dt$Label_GI)
+
+#defino los inputs
+x_train_PC <- dt[, 5:7]
+x_train <- dt$Sequence
+
+
+
+#Preparar los datos para que puedan entrar en los modelos
+y_train_TRA <- matrix(y_train_TRA, ncol = 1)
+y_train_GI <- matrix(y_train_GI, ncol = 1)
+    
+    #Modelo denso: conversion a tensores
+x_train_PC <- as_tensor(x_train_PC)
+x_train_PC <- as.matrix(x_train_PC)
+
+    #Modelo LSTM: vectorizar secuencia
+# vocabulario
+vocab <- c("A", "C", "D", "E", "F", "G", "H", "I", "K", "L", 
+           "M", "N", "P", "Q", "R", "S", "T", "V", "W", "Y")
+
+max_len <- 271
+
+# Crear el vectorizador 
+text_vectorizer <- layer_text_vectorization(
+  standardize = NULL,                    
+  max_tokens = length(vocab) + 2,     # AA + UNK + 0(padding)
+  output_mode = "int",
+  output_sequence_length = max_len,
+  split = "character"                    
+)
+
+
+text_vectorizer %>% set_vocabulary(vocab)
+
+# Aplico text_vectoricer a las secuencias
+vectorized_train <- text_vectorizer(x_train)
+
+# transformo en array
+x_train <- as.array(vectorized_train)
+
+
+max_tokens <- 22 
+seq_length <- 271 
+
+```
+## Folds y Modelo
+```{r}
+#En cada iteración 4 folds para train y 1 xa validar
+k_folds <- 5
+set.seed(123456)
+folds <- createFolds(y = y_train_GI, k = k_folds, list = TRUE)
+
+# Para almacenar los resultados de cada fold
+#aqui las matrices de confusión de cada salida
+conf_matrices_GI <- list()
+conf_matrices_TRA <- list()
+#métricas
+results <- list(accuracy_GI = numeric(k_folds), accuracy_TRA = numeric(k_folds))
+#gráficos
+plot_list <- list()
+plot_a_list <- list()
+
+
+for (i in seq_along(folds)) {
+  
+  # Dividir datos en entrenamiento y validación para este fold
+  val_idx <- folds[[i]] #los indices del fold actual son los utilizados para validar
+  train_idx <- setdiff(seq_len(length(y_train_GI)), val_idx)#indices restantes para train (setdiff: diferencia entre todos los indices y los destinados a val)
+  
+#datos train  
+  x_train_fold_PC <- x_train_PC[train_idx, , drop = FALSE]
+  x_train_fold_seq <- x_train[train_idx, , drop = FALSE]
+  y_train_fold_GI <- y_train_GI[train_idx]
+  y_train_fold_TRA <- y_train_TRA[train_idx]
+  
+#datos val
+  x_val_fold_PC <- x_train_PC[val_idx, , drop = FALSE]
+  x_val_fold_seq <- x_train[val_idx, , drop = FALSE]
+  y_val_fold_GI <- y_train_GI[val_idx]
+  y_val_fold_TRA <- y_train_TRA[val_idx]
+
+## Modelo
+# modelo denso para los PC (= q el de no cv)
+  input_pc <- layer_input(shape = c(ncol(x_train_PC)), name = "input_pc")
+  dense_pc <- input_pc %>%
+    layer_dense(units = 16, activation = "relu") %>%
+    layer_dense(units = 8, activation = "relu")
+#LSTM para las secuencias 
+  inputs <- layer_input(shape = c(seq_length), dtype = "int64")
+  embedded <- inputs %>%
+    tf$one_hot(depth = as.integer(max_tokens)) %>% #codifico a one-hot
+    bidirectional(layer_lstm(units = 32, return_sequences = FALSE)) #32 units  = que LSTM, en concat entradas puse 64
+  
+#concatenar los2
+  merged <- layer_concatenate(list(dense_pc, embedded))
+  
+#2 salidas
+ 
+#capa final tb densa. binaria. salida probabilidad sigmoide 
+  #salida_GI
+  output_GI <- merged %>%
+    layer_dense(units = 32, activation = "relu") %>%
+    layer_dropout(rate = 0.5) %>%
+    layer_dense(units = 1, activation = "sigmoid", , name = "output_GI")
+  #salida TRA
+  output_TRA <- merged %>%
+    layer_dense(units = 32, activation = "relu") %>%
+    layer_dropout(rate = 0.5) %>%
+    layer_dense(units = 1, activation = "sigmoid", name = "output_TRA")
+  
+ model <- keras_model(
+   inputs = list(input_pc, inputs), 
+   outputs = list(output_GI, output_TRA))
+  
+  model %>% compile(
+    optimizer = optimizer_rmsprop(learning_rate = 0.001),
+    loss = list(output_GI = "binary_crossentropy", output_TRA = "binary_crossentropy"),
+    metrics = list(output_GI = "accuracy", output_TRA = "accuracy")
+  )
+  
+   # entrenamiento, igual qiue el que no lleva cv
+  history <- model %>% fit(
+    list(x_train_fold_PC, x_train_fold_seq), 
+    list(output_GI = y_train_fold_GI, output_TRA = y_train_fold_TRA),
+    validation_data = list(
+      list(x_val_fold_PC, x_val_fold_seq), 
+      list(output_GI = y_val_fold_GI, output_TRA = y_val_fold_TRA)),
+    epochs = 20,
+    batch_size = 32,
+    verbose = 1
+  )
+  
+
+  
+  
+  
+        # Predicciones conjunto de validación
+y_pred <- model %>% predict(list(x_val_fold_PC, x_val_fold_seq))
+
+# Extraer predicciones para cada salida
+y_pred_GI <- y_pred[[1]]  # Predicciones para la salida GI
+y_pred_TRA <- y_pred[[2]] # Predicciones para la salida TRA
+
+# Convertir predicciones a binario
+y_pred_GI_bin <- ifelse(y_pred_GI > 0.5, 1, 0)
+y_pred_TRA_bin <- ifelse(y_pred_TRA > 0.5, 1, 0)
+  
+
+  #matrices de confusión:
+   # Label_GI
+  conf_matrix_GI <- confusionMatrix(
+  factor(y_pred_GI_bin[, 1], levels = c(0, 1)), # Predicciones GI
+  factor(y_val_fold_GI, levels = c(0, 1)), # Reales GI
+  positive =  "1"
+)
+  print(conf_matrix_GI)
+  conf_matrices_GI[[i]] <- conf_matrix_GI
+  
+    #Label_TRA
+  conf_matrix_TRA <- confusionMatrix(
+  factor(y_pred_TRA_bin[, 1], levels = c(0, 1)), # Predicciones TRA
+  factor(y_val_fold_TRA, levels = c(0, 1)),      # Reales TRA
+  positive =  "1"
+)
+  print(conf_matrix_TRA)
+  conf_matrices_TRA[[i]] <- conf_matrix_TRA
+  
+  
+  results$accuracy_GI[i] <- conf_matrix_GI$overall["Accuracy"]
+  results$accuracy_TRA[i] <- conf_matrix_TRA$overall["Accuracy"]
+  
+
+  # Convertir el history a data.frame para graficar
+  history_df <- data.frame(
+    epoch = seq_len(length(history$metrics$output_GI_loss)),
+    loss_GI = history$metrics$output_GI_loss,
+    val_loss_GI = history$metrics$val_output_GI_loss,
+    loss_TRA = history$metrics$output_TRA_loss,
+    val_loss_TRA = history$metrics$val_output_TRA_loss,
+    accuracy_GI = history$metrics$output_GI_accuracy,
+    val_accuracy_GI = history$metrics$val_output_GI_accuracy,
+    accuracy_TRA = history$metrics$output_TRA_accuracy,
+    val_accuracy_TRA = history$metrics$val_output_TRA_accuracy
+  )
+  
+  
+  # Generar gráfico de loss  
+
+      p <- ggplot(history_df, aes(x = epoch)) +
+    geom_line(aes(y = loss_GI), color = "gray", linetype = "dashed", size = 1, alpha = 0.7) +
+    geom_line(aes(y = val_loss_GI), color = "blue", size = 1) +
+    geom_line(aes(y = loss_TRA), color = "gray", linetype = "dotted", size = 1, alpha = 0.7) +
+    geom_line(aes(y = val_loss_TRA), color = "red", size = 1) +
+    labs(title = paste("Fold", i, "- Loss"), y = "Loss", x = "Epoch") +
+    theme_minimal()
+    
+   plot_list[[i]] <- p
+   
+     # Generar gráfico de accuracy
+   
+    q <- ggplot(history_df, aes(x = epoch)) +
+    geom_line(aes(y = accuracy_GI), color = "gray", linetype = "dashed", size = 1, alpha = 0.7) +
+    geom_line(aes(y = val_accuracy_GI), color = "blue", size = 1) +
+    geom_line(aes(y = accuracy_TRA), color = "gray", linetype = "dotted", size = 1, alpha = 0.7) +
+    geom_line(aes(y = val_accuracy_TRA), color = "red", size = 1) +
+    labs(title = paste("Fold", i, "- Accuracy"), y = "Accuracy", x = "Epoch") +
+    theme_minimal()
+   
+   plot_a_list[[i]] <- q
+
+
+}
+
+
+#results
+
+  for (i in seq_along(conf_matrices_GI)) {
+  cat("\nFold", i, "- Matriz de Confusión GI:\n")
+  print(conf_matrices_GI[[i]])
+  
+  cat("\nFold", i, "- Matriz de Confusión TRA:\n")
+  print(conf_matrices_TRA[[i]])
+}
+
+for (i in seq_along(plot_list)) {
+  print(plot_list[[i]])
+}
+
+for (i in seq_along(plot_list)) {
+  print(plot_a_list[[i]])
+}
+
+
+```
